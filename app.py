@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 # --- 1. 页面配置 ---
 st.set_page_config(
-    page_title="美股收租工厂 (双策略版)", 
+    page_title="美股收租工厂 (说明书版)", 
     layout="wide", 
     page_icon="🏭",
     initial_sidebar_state="expanded"
@@ -24,6 +24,11 @@ st.markdown("""
     /* 隐藏表格索引 */
     thead tr th:first-child {display:none}
     tbody th {display:none}
+    /* 说明书样式微调 */
+    .streamlit-expanderHeader {
+        font-weight: bold;
+        color: #FF4B4B;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -31,9 +36,6 @@ st.markdown("""
 
 @st.cache_data(ttl=300)
 def fetch_market_data(ticker, min_days, max_days, strategy_type):
-    """
-    strategy_type: 'CSP' (卖Put) 或 'CC' (卖Call)
-    """
     try:
         stock = yf.Ticker(ticker)
         history = stock.history(period="1d")
@@ -64,30 +66,21 @@ def fetch_market_data(ticker, min_days, max_days, strategy_type):
                 opt = stock.option_chain(date)
                 
                 if strategy_type == 'CSP':
-                    # 卖Put: 找比现价低的 (OTM Puts)
                     options = opt.puts
-                    # 筛选行权价 < 现价 * 1.05
                     options = options[options['strike'] < current_price * 1.05].copy()
-                    # 安全垫计算: (现价 - 行权价) / 现价
                     options['distance_pct'] = (current_price - options['strike']) / current_price
-                    # ROI 分母: 保证金 (行权价)
                     capital_required = options['strike']
                     
-                else: # strategy_type == 'CC' (Covered Call)
-                    # 卖Call: 找比现价高的 (OTM Calls)
+                else: 
                     options = opt.calls
-                    # 筛选行权价 > 现价 * 0.95 (稍微给点容错)
                     options = options[options['strike'] > current_price * 0.95].copy()
-                    # 上涨空间计算: (行权价 - 现价) / 现价
                     options['distance_pct'] = (options['strike'] - current_price) / current_price
-                    # ROI 分母: 持仓成本 (假设为当前现价)
                     capital_required = current_price
 
                 options['days_to_exp'] = days
                 options['expiration_date'] = date
                 options = options[options['bid'] > 0.01] 
                 
-                # 核心收益计算
                 options['roi'] = options['bid'] / capital_required
                 options['annualized_return'] = options['roi'] * (365 / days)
                 
@@ -109,18 +102,15 @@ def fetch_market_data(ticker, min_days, max_days, strategy_type):
 with st.sidebar:
     st.header("🏭 策略工厂")
     
-    # 策略选择器
     strategy = st.radio(
         "选择你的持仓状态:",
         ("🟢 没货，想抄底收租 (CSP)", "🔴 有货，想止盈回血 (CC)"),
-        captions=["策略: Cash-Secured Put", "策略: Covered Call"]
+        captions=["Cash-Secured Put", "Covered Call"]
     )
-    
     strat_code = 'CSP' if "CSP" in strategy else 'CC'
 
     st.divider()
     
-    # 标的选择
     preset_tickers = {
         "QQQ (纳指100)": "QQQ",
         "SPY (标普500)": "SPY",
@@ -146,17 +136,43 @@ with st.sidebar:
     if st.button("🔄 运行策略", use_container_width=True, type="primary"):
         st.cache_data.clear()
 
-# 主界面逻辑
+# --- 主界面 ---
+
+st.title(f"💸 {ticker} 收租雷达")
+
+# >>>>>>> 这里是新加的产品说明书 <<<<<<<
+with st.expander("📖 产品说明书 / 新手指南 (点击展开)", expanded=False):
+    st.markdown("""
+    ### 欢迎使用美股收租工厂 (The Option Wheel)
+    本工具旨在帮助投资者寻找**高胜率**的期权收租机会。请根据您的持仓情况选择模式：
+    
+    #### 1️⃣ 模式一：🟢 没货 (Cash-Secured Put)
+    * **适用场景**：你现在持有现金，想以打折价买入股票，或者单纯想赚点权利金。
+    * **核心逻辑**：作为“保险公司”，承诺在未来以**行权价**接盘股票。
+    * **最好情况**：股价没跌破行权价 -> **白赚权利金**。
+    * **最坏情况**：股价大跌 -> 你必须以行权价买入股票（此时你的持仓成本 = 行权价 - 权利金）。
+    * **指标解释**：
+        * `安全垫`：股价还要跌多少你才开始亏损。
+    
+    #### 2️⃣ 模式二：🔴 有货 (Covered Call)
+    * **适用场景**：你已经被套了，或者长期持有正股，想在持有的同时赚外快。
+    * **核心逻辑**：承诺在未来如果股价涨得太高，就以**行权价**卖出股票。
+    * **最好情况**：股价没涨到行权价 -> **股票还在，白赚权利金**。
+    * **最坏情况**：股价暴涨 -> 股票被行权价卖飞（少赚了暴涨的部分，但没亏钱）。
+    * **指标解释**：
+        * `踏空垫`：股价还能涨多少才会被强制卖出。
+    
+    ---
+    ⚠️ **风险提示**：本工具仅基于数学模型进行筛选，不构成投资建议。期权交易存在风险，请结合财报日期和技术面综合判断。
+    """)
+
+# 动态标题逻辑
 if strat_code == 'CSP':
-    st.title(f"📉 {ticker} 抄底收租 (Put)")
     dist_label = "安全垫 (跌幅保护)"
     dist_help = "股票跌多少以内，你都是赚的"
-    color_theme = "inverse" # 进度条颜色逻辑
 else:
-    st.title(f"📈 {ticker} 持仓回血 (Call)")
     dist_label = "踏空垫 (上涨空间)"
     dist_help = "股票涨多少以内，股票不会被卖飞"
-    color_theme = "normal"
 
 with st.spinner(f'正在计算 {ticker} 的最佳 {strat_code} 策略...'):
     df, current_price, error_msg = fetch_market_data(ticker, min_dte, max_dte, strat_code)
@@ -166,21 +182,17 @@ if error_msg:
 else:
     st.metric("📊 当前股价", f"${current_price:.2f}")
 
-    # --- 智能推荐卡片 ---
-    st.subheader("🤖 智能推荐 (Best Pick)")
+    # --- 智能推荐 ---
+    st.subheader("🤖 智能推荐")
     
-    # 统一将 distance 转为百分比数值处理
     df_calc = df.copy()
     df_calc['dist_pct_val'] = df_calc['distance_pct'] * 100
     
     if strat_code == 'CSP':
-        # Put: 离现价越远越安全 (安全垫大)
         aggressive = df_calc[(df_calc['dist_pct_val'] < 4) & (df_calc['dist_pct_val'] > 0.5)].sort_values('annualized_return', ascending=False).head(1)
         balanced = df_calc[(df_calc['dist_pct_val'] >= 4) & (df_calc['dist_pct_val'] < 8)].sort_values('annualized_return', ascending=False).head(1)
         safe = df_calc[df_calc['dist_pct_val'] >= 8].sort_values('annualized_return', ascending=False).head(1)
     else:
-        # Call: 离现价越远越不容易卖飞 (上涨空间大)
-        # 激进: 行权价就在现价附近，容易卖飞，但权利金高
         aggressive = df_calc[(df_calc['dist_pct_val'] < 3) & (df_calc['dist_pct_val'] >= 0)].sort_values('annualized_return', ascending=False).head(1)
         balanced = df_calc[(df_calc['dist_pct_val'] >= 3) & (df_calc['dist_pct_val'] < 7)].sort_values('annualized_return', ascending=False).head(1)
         safe = df_calc[df_calc['dist_pct_val'] >= 7].sort_values('annualized_return', ascending=False).head(1)
@@ -205,7 +217,6 @@ else:
     st.divider()
     st.subheader(f"📋 策略详情 ({strat_code})")
     
-    # 准备展示数据
     display_df = df[['expiration_date', 'strike', 'bid', 'distance_pct', 'annualized_return']].copy()
     
     st.dataframe(
@@ -223,7 +234,7 @@ else:
                 dist_label,
                 help=dist_help,
                 format="%.2f%%",
-                min_value=-0.05, # 允许稍微有点负数（价内）
+                min_value=-0.05,
                 max_value=0.15,
             ),
             "annualized_return": st.column_config.NumberColumn(
