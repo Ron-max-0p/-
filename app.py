@@ -21,8 +21,9 @@ st.markdown("""
         border-radius: 10px;
         margin-bottom: 10px;
     }
-    /* 调整表格字体大小 */
-    .stDataFrame { font-size: 1.1rem; }
+    /* 隐藏表格索引列 */
+    thead tr th:first-child {display:none}
+    tbody th {display:none}
 </style>
 """, unsafe_allow_html=True)
 
@@ -34,7 +35,7 @@ def fetch_market_data(ticker, min_days, max_days):
         stock = yf.Ticker(ticker)
         history = stock.history(period="1d")
         if history.empty:
-            return None, 0, "无法获取股价数据，请检查代码是否正确"
+            return None, 0, "无法获取股价数据"
         current_price = history['Close'].iloc[-1]
         
         expirations = stock.options
@@ -60,18 +61,16 @@ def fetch_market_data(ticker, min_days, max_days):
                 opt = stock.option_chain(date)
                 puts = opt.puts
                 
-                # 筛选逻辑
                 strike_threshold = current_price * 1.05 
                 puts = puts[puts['strike'] < strike_threshold].copy()
                 
-                # 计算字段
                 puts['days_to_exp'] = days
                 puts['expiration_date'] = date
-                puts['distance_pct'] = (current_price - puts['strike']) / current_price * 100
+                puts['distance_pct'] = (current_price - puts['strike']) / current_price 
                 puts = puts[puts['bid'] > 0.01] 
                 
                 puts['roi'] = puts['bid'] / puts['strike']
-                puts['annualized_return'] = puts['roi'] * (365 / days) * 100
+                puts['annualized_return'] = puts['roi'] * (365 / days)
                 
                 all_puts.append(puts)
             except Exception:
@@ -88,11 +87,9 @@ def fetch_market_data(ticker, min_days, max_days):
 
 # --- 4. 界面渲染区 ---
 
-# 侧边栏
 with st.sidebar:
     st.header("🛠️ 策略参数")
     
-    # --- 新增：热门标的下拉菜单 ---
     preset_tickers = {
         "QQQ (纳指100)": "QQQ",
         "SPY (标普500)": "SPY",
@@ -103,6 +100,7 @@ with st.sidebar:
         "AMZN (亚马逊)": "AMZN",
         "GOOGL (谷歌)": "GOOGL",
         "META (脸书)": "META",
+        "MARA (比特币矿股)": "MARA",
         "自定义...": "CUSTOM"
     }
     
@@ -112,8 +110,8 @@ with st.sidebar:
         ticker = st.text_input("输入股票代码", value="IWM").upper()
     else:
         ticker = preset_tickers[selected_label]
-        st.caption(f"当前选中: {ticker}")
-
+    
+    st.caption(f"当前选中: {ticker}")
     st.divider()
     col_d1, col_d2 = st.columns(2)
     min_dte = col_d1.number_input("最近天数", value=14, step=1)
@@ -127,22 +125,26 @@ with st.sidebar:
 st.title(f"💸 {ticker} 收租雷达")
 st.markdown("通过 **Cash-Secured Put** 策略，寻找高性价比的权利金收入。")
 
-with st.spinner(f'正在分析 {ticker} 的期权链数据...'):
+with st.spinner(f'正在获取 {ticker} 实时数据...'):
     df, current_price, error_msg = fetch_market_data(ticker, min_dte, max_dte)
 
 if error_msg:
     st.error(f"出错啦: {error_msg}")
 else:
-    st.metric("📊 当前股价", f"${current_price:.2f}")
+    st.metric("当前股价", f"${current_price:.2f}")
 
-    # --- 智能推荐卡片 ---
+    # --- 智能推荐 ---
     st.subheader("最佳收租点位推荐")
     
-    aggressive = df[(df['distance_pct'] < 4) & (df['distance_pct'] > 0.5)].sort_values('annualized_return', ascending=False).head(1)
-    balanced = df[(df['distance_pct'] >= 4) & (df['distance_pct'] < 8)].sort_values('annualized_return', ascending=False).head(1)
-    safe = df[df['distance_pct'] >= 8].sort_values('annualized_return', ascending=False).head(1)
+    # 转换为百分比数值用于筛选
+    df_calc = df.copy()
+    df_calc['dist_pct_val'] = df_calc['distance_pct'] * 100
+    
+    aggressive = df_calc[(df_calc['dist_pct_val'] < 4) & (df_calc['dist_pct_val'] > 0.5)].sort_values('annualized_return', ascending=False).head(1)
+    balanced = df_calc[(df_calc['dist_pct_val'] >= 4) & (df_calc['dist_pct_val'] < 8)].sort_values('annualized_return', ascending=False).head(1)
+    safe = df_calc[df_calc['dist_pct_val'] >= 8].sort_values('annualized_return', ascending=False).head(1)
 
-    tab1, tab2, tab3 = st.tabs(["激进", "稳健", "保守"])
+    tab1, tab2, tab3 = st.tabs(["激进型", "稳健型", "保守型"])
 
     def render_card(data):
         if data.empty:
@@ -154,33 +156,50 @@ else:
             with c1:
                 st.markdown(f"**行权价**: :orange[${row['strike']}]")
                 st.markdown(f"**到期日**: {row['expiration_date']} ({row['days_to_exp']}天)")
-                st.markdown(f"**安全垫**: 下跌 {row['distance_pct']:.1f}% 内不亏")
+                st.markdown(f"**安全垫**: 下跌 {row['distance_pct']:.2%} 内不亏")
             with c2:
-                st.metric("年化收益率", f"{row['annualized_return']:.1f}%", delta="预估")
-            st.info(f"💰 先拿权利金: **${row['bid']*100:.0f}**")
+                # 修复颜色显示，确保高亮
+                st.metric("年化收益率", f"{row['annualized_return']:.2%}")
+            st.info(f"先拿权利金: **${row['bid']*100:.0f}**")
 
     with tab1: render_card(aggressive)
     with tab2: render_card(balanced)
     with tab3: render_card(safe)
 
-    # --- 数据透视 (汉化处理) ---
+    # --- 数据透视 (核心升级点) ---
     st.divider()
-    with st.expander("🔎 查看所有机会 (汉化完整表)", expanded=True):
+    with st.expander("🔎 查看所有机会 (已自动格式化)", expanded=True):
         
-        # 1. 提取需要的列
+        # 准备数据
         display_df = df[['expiration_date', 'strike', 'bid', 'distance_pct', 'annualized_return']].copy()
         
-        # 2. 改名 (汉化关键步骤)
-        display_df.columns = ['到期日', '行权价', '权利金(Bid)', '安全垫(%)', '年化收益率(%)']
-        
-        # 3. 排序并展示
+        # 使用 column_config 强制定义列的属性
+        # 这样用户不需要手动去点 Format，也就不太需要用那个英文菜单了
         st.dataframe(
-            display_df.sort_values('年化收益率(%)', ascending=False).style.format({
-                '权利金(Bid)': '${:.2f}',
-                '安全垫(%)': '{:.2f}%',
-                '年化收益率(%)': '{:.2f}%',
-                '行权价': '${:.1f}'
-            }),
+            display_df,
+            column_order=("expiration_date", "strike", "bid", "distance_pct", "annualized_return"),
+            column_config={
+                "expiration_date": st.column_config.DateColumn("到期日"),
+                "strike": st.column_config.NumberColumn(
+                    "行权价 (Strike)",
+                    format="$%.1f", # 强制显示美元
+                ),
+                "bid": st.column_config.NumberColumn(
+                    "权利金 (Bid)",
+                    format="$%.2f", # 强制显示美元
+                ),
+                "distance_pct": st.column_config.ProgressColumn(
+                    "安全垫 (跌幅保护)",
+                    format="%.2f%%", # 强制显示百分比
+                    min_value=0,
+                    max_value=0.15, # 进度条最大值设为15%
+                ),
+                "annualized_return": st.column_config.NumberColumn(
+                    "年化收益率 (ARP)",
+                    format="%.2f%%", # 强制显示百分比
+                ),
+            },
+            hide_index=True, # 隐藏讨厌的 0,1,2,3 索引列
             use_container_width=True,
-            height=500 
+            height=500
         )
