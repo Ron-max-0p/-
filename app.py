@@ -7,7 +7,7 @@ import numpy as np
 
 # --- 1. 页面配置 ---
 st.set_page_config(
-    page_title="美股收租工厂 (纯净版)", 
+    page_title="美股收租工厂 (深度版)", 
     layout="wide", 
     page_icon="🏭",
     initial_sidebar_state="expanded"
@@ -31,7 +31,7 @@ st.markdown("""
 # --- 3. 核心逻辑区 ---
 
 @st.cache_data(ttl=300)
-def fetch_market_data(ticker, min_days, max_days, strategy_type, spread_width=5):
+def fetch_market_data(ticker, min_days, max_days, strategy_type, spread_width, strike_range_pct):
     try:
         stock = yf.Ticker(ticker)
         history = stock.history(period="3mo") 
@@ -53,28 +53,42 @@ def fetch_market_data(ticker, min_days, max_days, strategy_type, spread_width=5)
 
         all_opportunities = []
         
+        # 计算价格筛选范围 (上下限)
+        # 比如现价100，范围20%，则找 80 ~ 120 之间的所有期权
+        lower_bound = current_price * (1 - strike_range_pct / 100)
+        upper_bound = current_price * (1 + strike_range_pct / 100)
+        
         for date, days in valid_dates:
             try:
                 opt = stock.option_chain(date)
                 calls = opt.calls
                 puts = opt.puts
                 
+                # --- 核心修改：放宽筛选逻辑 ---
                 if strategy_type == 'CSP': 
-                    candidates = puts[puts['strike'] < current_price * 1.05].copy()
+                    # 以前是只找比现价低的，现在允许用户看全范围
+                    candidates = puts[(puts['strike'] >= lower_bound) & (puts['strike'] <= upper_bound)].copy()
                     candidates['distance_pct'] = (current_price - candidates['strike']) / current_price
                     candidates['capital'] = candidates['strike'] * 100
                     candidates['credit'] = candidates['bid']
-                    candidates['roi'] = candidates['credit'] * 100 / candidates['capital']
+                    # 避免除以0
+                    candidates['roi'] = candidates.apply(lambda x: x['credit'] * 100 / x['capital'] if x['capital'] > 0 else 0, axis=1)
                     
                 elif strategy_type == 'CC': 
-                    candidates = calls[calls['strike'] > current_price * 0.95].copy()
+                    candidates = calls[(calls['strike'] >= lower_bound) & (calls['strike'] <= upper_bound)].copy()
                     candidates['distance_pct'] = (candidates['strike'] - current_price) / current_price
                     candidates['capital'] = current_price * 100
                     candidates['credit'] = candidates['bid']
                     candidates['roi'] = candidates['credit'] * 100 / candidates['capital']
                     
                 elif strategy_type == 'SPREAD':
-                    shorts = puts[puts['strike'] < current_price].copy()
+                    # Spread 策略逻辑复杂，还是只找 OTM (价外) 的比较合理，否则计算量太大
+                    if strat_code == 'SPREAD':
+                         # 默认只看现价以下的 Put (Bull Put Spread)
+                         shorts = puts[puts['strike'] < current_price].copy()
+                         # 也要符合范围限制
+                         shorts = shorts[shorts['strike'] >= lower_bound]
+                    
                     spreads = []
                     for index, short_row in shorts.iterrows():
                         target_long_strike = short_row['strike'] - spread_width
@@ -99,10 +113,8 @@ def fetch_market_data(ticker, min_days, max_days, strategy_type, spread_width=5)
                 if not candidates.empty:
                     candidates['days_to_exp'] = days
                     candidates['expiration_date'] = date
-                    candidates = candidates[candidates['bid'] > 0.01] 
-                    
-                    # >>> 删除了胜率估算，只保留确定性数学计算 <<<
-                    
+                    # 只过滤掉 bid 为 0 的垃圾数据
+                    candidates = candidates[candidates['bid'] > 0] 
                     candidates['annualized_return'] = candidates['roi'] * (365 / days)
                     all_opportunities.append(candidates)
                     
@@ -118,12 +130,9 @@ def fetch_market_data(ticker, min_days, max_days, strategy_type, spread_width=5)
         return None, 0, None, f"API 错误: {str(e)}"
 
 def render_chart(history_df, ticker, target_strike=None):
-    """画K线图和安全线"""
     fig = go.Figure(data=[go.Candlestick(x=history_df.index,
-                open=history_df['Open'],
-                high=history_df['High'],
-                low=history_df['Low'],
-                close=history_df['Close'],
+                open=history_df['Open'], high=history_df['High'],
+                low=history_df['Low'], close=history_df['Close'],
                 name=ticker)])
 
     current_price = history_df['Close'].iloc[-1]
@@ -137,25 +146,21 @@ def render_chart(history_df, ticker, target_strike=None):
         else: 
             fig.add_hrect(y0=current_price, y1=target_strike, fillcolor="red", opacity=0.1, line_width=0)
 
-    fig.update_layout(
-        title=f"{ticker} 走势与安全垫可视化",
-        height=400,
-        margin=dict(l=20, r=20, t=40, b=20),
-        xaxis_rangeslider_visible=False,
-        template="plotly_dark"
-    )
+    fig.update_layout(title=f"{ticker} K线图", height=400, margin=dict(l=20, r=20, t=40, b=20), xaxis_rangeslider_visible=False, template="plotly_dark")
     st.plotly_chart(fig, use_container_width=True)
 
 # --- 4. 界面渲染区 ---
 
 with st.sidebar:
-    st.header("🏭 策略军火库")
+    st.header("🏭 策略参数")
+    
+    # 策略选择
     cat_map = {
         "🔰 入门收租 (单腿)": ["CSP (现金担保Put)", "CC (持股备兑Call)"],
         "🚀 进阶杠杆 (垂直价差)": ["Bull Put Spread (牛市看跌价差)"]
     }
-    category = st.selectbox("选择策略等级", list(cat_map.keys()))
-    strategy_name = st.selectbox("选择具体策略", cat_map[category])
+    category = st.selectbox("策略类型", list(cat_map.keys()))
+    strategy_name = st.selectbox("具体策略", cat_map[category])
     
     if "CSP" in strategy_name: strat_code = 'CSP'
     elif "CC" in strategy_name: strat_code = 'CC'
@@ -166,40 +171,44 @@ with st.sidebar:
         spread_width = st.slider("价差宽度", 1, 20, 5)
 
     st.divider()
+    
+    # >>> 新增：行权价范围控制 <<<
+    st.markdown("### 🔍 扫描深度")
+    strike_range_pct = st.slider(
+        "行权价覆盖范围 (±%)", 
+        min_value=5, 
+        max_value=30, 
+        value=15, 
+        step=5,
+        help="数值越大，看到的行权价越多（包含深虚值和实值）。"
+    )
+    
+    st.divider()
+    
     preset_tickers = {"NVDA": "NVDA", "TSLA": "TSLA", "QQQ": "QQQ", "SPY": "SPY", "MSTR": "MSTR", "COIN": "COIN"}
     ticker_key = st.selectbox("选择标的", list(preset_tickers.keys()) + ["自定义..."])
     ticker = st.text_input("代码", value="AMD").upper() if ticker_key == "自定义..." else preset_tickers[ticker_key]
     
-    st.divider()
-    if st.button("🚀 扫描机会", type="primary", use_container_width=True):
+    c1, c2 = st.columns(2)
+    min_dte = c1.number_input("最近", 14)
+    max_dte = c2.number_input("最远", 45)
+    
+    if st.button("🚀 全面扫描", type="primary", use_container_width=True):
         st.cache_data.clear()
 
 # --- 主界面 ---
-st.title(f"📊 {ticker} 策略可视化")
+st.title(f"📊 {ticker} 深度数据")
 
-# 说明书
-expander_title = "📖 策略说明书 (点击展开)"
-help_text = ""
-if strat_code == 'CSP':
-    help_text = "### 🟢 Cash-Secured Put\n我是土豪，我有钱。如果跌到行权价，我愿意全款买入股票。"
-elif strat_code == 'CC':
-    help_text = "### 🔴 Covered Call\n我有股票。如果涨到行权价，我愿意卖出股票止盈。"
-else:
-    help_text = f"### 🚀 Bull Put Spread\n用小资金收租。卖出一个贵的Put，买入一个便宜的Put做保护。最大亏损锁定为 ${spread_width*100}。"
-
-with st.expander(expander_title):
-    st.markdown(help_text)
-
-with st.spinner('正在获取数据并绘图...'):
-    df, current_price, history, error_msg = fetch_market_data(ticker, 14, 45, strat_code, spread_width)
+with st.spinner('正在拉取全量数据...'):
+    df, current_price, history, error_msg = fetch_market_data(ticker, min_dte, max_dte, strat_code, spread_width, strike_range_pct)
 
 if error_msg:
     st.error(error_msg)
 else:
+    # 还是保留一个 AI 推荐，给不想看表的人
     df['score_val'] = df['distance_pct'] * 100
     if strat_code == 'SPREAD':
-        rec_col = 'annualized_return'
-        best_pick = df[(df['score_val'] >= 3) & (df['score_val'] < 10)].sort_values(rec_col, ascending=False).head(1)
+        best_pick = df[(df['score_val'] >= 3) & (df['score_val'] < 10)].sort_values('annualized_return', ascending=False).head(1)
     else:
         best_pick = df[(df['score_val'] >= 4) & (df['score_val'] < 10)].sort_values('annualized_return', ascending=False).head(1)
     
@@ -212,26 +221,31 @@ else:
 
     if not best_pick.empty:
         r = best_pick.iloc[0]
-        # 删除了胜率显示，只保留硬数据
-        st.success(f"🤖 **AI 推荐**: 行权价 **${r['strike']}** | 年化收益 **{r['annualized_return']:.1%}** | 安全垫 **{r['distance_pct']:.1%}**")
+        st.info(f"💡 **AI 参考**: 行权价 ${r['strike']} (年化 {r['annualized_return']:.1%})")
 
     st.divider()
-    st.subheader("📋 机会列表 (纯净数据)")
+    st.subheader(f"📋 完整期权链 (已加载 {len(df)} 条数据)")
     
     final_df = df.copy()
     if 'display_strike' in final_df.columns:
         final_df['strike'] = final_df['display_strike']
 
-    # 表格里也删除了 win_rate 列
+    # 完整表格配置
     st.dataframe(
         final_df[['expiration_date', 'strike', 'bid', 'distance_pct', 'annualized_return']],
         column_config={
             "expiration_date": st.column_config.DateColumn("到期日"),
             "strike": st.column_config.TextColumn("行权价"),
             "bid": st.column_config.NumberColumn("权利金", format="$%.2f"),
-            "distance_pct": st.column_config.ProgressColumn("安全垫", format="%.2f%%", min_value=-0.1, max_value=0.2),
+            "distance_pct": st.column_config.ProgressColumn(
+                "安全垫 (Distance)", 
+                format="%.2f%%", 
+                min_value=-0.2, # 允许显示负数（价内）
+                max_value=0.2
+            ),
             "annualized_return": st.column_config.NumberColumn("年化收益", format="%.2f%%"),
         },
         use_container_width=True,
-        hide_index=True
+        hide_index=True,
+        height=800 # 增加高度，看更多行
     )
