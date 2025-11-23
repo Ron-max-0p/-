@@ -8,9 +8,9 @@ import scipy.stats as si
 
 # --- 1. 页面配置 ---
 st.set_page_config(
-    page_title="美股期权军火库 (宗师版)", 
+    page_title="美股期权终极军火库 (全集版)", 
     layout="wide", 
-    page_icon="🐉",
+    page_icon="♾️",
     initial_sidebar_state="expanded"
 )
 
@@ -23,7 +23,7 @@ st.markdown("""
     .trade-leg { padding: 4px 8px; border-radius: 4px; margin-bottom: 3px; font-family: monospace; font-size: 0.9em; }
     .sell-leg { background-color: #3d0000; color: #ff9999; border-left: 3px solid #ff4b4b; }
     .buy-leg { background-color: #002b00; color: #99ffbb; border-left: 3px solid #00cc96; }
-    .ratio-tag { background-color: #4b0082; color: #fff; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; }
+    .risk-badge { padding: 2px 6px; border-radius: 4px; font-size: 0.8em; font-weight: bold; background: #555; color: #fff; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -39,206 +39,372 @@ def process_chain(df, current_price, days_to_exp, type, risk_free_rate=0.045):
     T = days_to_exp / 365.0
     df['type'] = type
     df['delta'] = df.apply(lambda x: black_scholes_delta(current_price, x['strike'], T, risk_free_rate, x['impliedVolatility'], type), axis=1)
-    return df[(df['openInterest'] > 10) & (df['bid'] > 0)].copy()
+    # 流动性初筛
+    return df[(df['openInterest'] > 5) & (df['bid'] > 0)].copy()
+
+def get_earnings_date(ticker_obj):
+    try:
+        cal = ticker_obj.calendar
+        if cal and 'Earnings Date' in cal: return cal['Earnings Date'][0]
+        return None
+    except: return None
+
+# --- 策略构建器集合 ---
+
+def build_spread(longs, shorts, width, type='credit'):
+    spreads = []
+    for _, s in shorts.iterrows():
+        target = s['strike'] - width if s['type']=='put' else s['strike'] + width
+        # Debit spread 逻辑相反，这里简化处理，主要服务 Credit Spread
+        
+        matches = longs[abs(longs['strike'] - target) < 0.1]
+        if not matches.empty:
+            l = matches.iloc[0]
+            net = s['bid'] - l['ask']
+            if net > 0.01:
+                loss = width - net
+                spreads.append({
+                    'desc': f"SELL {s['type'].upper()} ${s['strike']} / BUY {l['type'].upper()} ${l['strike']}",
+                    'price_display': net, 'capital': loss*100, 'roi': net/loss,
+                    'delta': s['delta'] - l['delta'],
+                    'breakeven': s['strike'] - net if s['type']=='put' else s['strike'] + net,
+                    'legs': [{'side':'SELL', 'type':s['type'].upper(), 'strike':s['strike']}, {'side':'BUY', 'type':l['type'].upper(), 'strike':l['strike']}]
+                })
+    return pd.DataFrame(spreads)
 
 @st.cache_data(ttl=300)
 def fetch_market_data(ticker, strat_code, spread_width, strike_range_pct):
     try:
         stock = yf.Ticker(ticker)
         history = stock.history(period="6mo") 
-        if history.empty: return None, 0, None, "无法获取股价"
+        if history.empty: return None, 0, None, None, "无法获取股价"
         current_price = history['Close'].iloc[-1]
+        next_earnings = get_earnings_date(stock)
         
         expirations = stock.options
-        if not expirations: return None, current_price, history, "无期权链"
+        if not expirations: return None, current_price, history, next_earnings, "无期权链"
 
-        valid_dates = []
+        # 日期预处理
         today = datetime.now().date()
-        for date_str in expirations:
-            exp_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-            days = (exp_date - today).days
-            if 14 <= days <= 60: valid_dates.append((date_str, days)) # 宗师策略通常做波段
-        
-        if not valid_dates: return None, current_price, history, "该时段无合适期权"
+        date_map = []
+        for d_str in expirations:
+            d_obj = datetime.strptime(d_str, "%Y-%m-%d").date()
+            days = (d_obj - today).days
+            date_map.append((d_str, days))
 
         all_opps = []
         
-        for date, days in valid_dates:
-            try:
-                opt = stock.option_chain(date)
-                calls = process_chain(opt.calls, current_price, days, 'call')
-                puts = process_chain(opt.puts, current_price, days, 'put')
-
-                if calls.empty or puts.empty: continue
+        # === 跨期策略逻辑 (PMCC / Calendar) ===
+        if strat_code in ['PMCC', 'CALENDAR']:
+            min_far = 150 if strat_code == 'PMCC' else 60
+            far_dates = [d for d in date_map if d[1] > min_far]
+            near_dates = [d for d in date_map if 20 <= d[1] <= 45]
+            
+            if far_dates and near_dates:
+                far_d, far_days = far_dates[0]
+                near_d, near_days = near_dates[0]
                 
-                # === 宗师级策略构建 ===
-
-                # 1. 玉蜥蜴 (Jade Lizard)
-                # 结构：Sell OTM Put + Sell OTM Call Spread (Bear Call Spread)
-                # 核心：收到的总权利金 > Call Spread 的宽度。这样上方就没有风险。
-                if strat_code == 'JADE_LIZARD':
-                    # A. 找卖 Put (Delta ~ -0.3)
-                    short_puts = puts[(puts['delta'] > -0.35) & (puts['delta'] < -0.2)]
-                    
-                    # B. 找 Call Spread (卖近买远)
-                    short_calls = calls[(calls['delta'] < 0.35) & (calls['delta'] > 0.2)]
-                    
-                    for _, p_row in short_puts.head(3).iterrows():
-                        for _, c_short in short_calls.head(3).iterrows():
-                            # 找 Long Call (保护)
-                            target_long = c_short['strike'] + spread_width
-                            c_longs = calls[abs(calls['strike'] - target_long) < 0.5]
-                            
-                            if not c_longs.empty:
-                                c_long = c_longs.iloc[0]
-                                
-                                # 计算钱
-                                credit_put = p_row['bid']
-                                credit_call_spread = c_short['bid'] - c_long['ask']
-                                total_credit = credit_put + credit_call_spread
-                                
-                                # 宗师级风控：无风险验证
-                                # 如果总权利金 > 价差宽，说明哪怕暴涨穿了 Call，你也赚钱
-                                upside_risk = spread_width - total_credit
-                                
-                                # 我们只筛选那些 "接近零风险" 或者 "完全零风险" 的
-                                if upside_risk < 0.5: # 允许一点点风险，或者负数(完全无风险)
-                                    risk_status = "🛡️ 上方无忧" if upside_risk <= 0 else f"⚠️ 上方微险 ${upside_risk*100:.0f}"
-                                    
-                                    all_opps.append({
-                                        'expiration_date': date, 'days_to_exp': days,
-                                        'desc': f"SELL PUT ${p_row['strike']} + SELL CALL ${c_short['strike']}/BUY ${c_long['strike']}",
-                                        'price_display': total_credit,
-                                        'capital': p_row['strike'] * 100 * 0.2, # 估算保证金
-                                        'roi': total_credit * 100 / (p_row['strike'] * 100 * 0.2),
-                                        'breakeven': f"下方 ${p_row['strike'] - total_credit:.2f}",
-                                        'special_note': risk_status,
-                                        'legs': [
-                                            {'side': 'SELL', 'type': 'PUT', 'strike': p_row['strike']},
-                                            {'side': 'SELL', 'type': 'CALL', 'strike': c_short['strike']},
-                                            {'side': 'BUY', 'type': 'CALL', 'strike': c_long['strike']}
-                                        ]
-                                    })
-
-                # 2. 比例价差 (Ratio Spread) - Call Front Ratio
-                # 结构：Buy 1 ATM Call + Sell 2 OTM Calls
-                # 核心：Net Credit (收钱开仓) 或 Zero Cost
-                elif strat_code == 'RATIO_SPREAD':
-                    # A. Buy 1 ATM Call (Delta ~ 0.6)
-                    long_calls = calls[(calls['delta'] > 0.55) & (calls['delta'] < 0.65)]
-                    
-                    for _, l_row in long_calls.head(3).iterrows():
-                        # B. Sell 2 OTM Calls (Delta ~ 0.3)
-                        # 我们希望 2 * Short_Bid > 1 * Long_Ask
-                        target_short_strike = l_row['strike'] + spread_width # 这里 spread_width 当作间距
-                        short_candidates = calls[abs(calls['strike'] - target_short_strike) < 2.0] # 稍微放宽搜索
-                        
-                        if not short_candidates.empty:
-                            s_row = short_candidates.iloc[0]
-                            
-                            net = (s_row['bid'] * 2) - l_row['ask']
-                            
-                            # 只找 收钱开仓 或者 极低成本 的
-                            if net > -0.5: 
-                                profit_peak = (s_row['strike'] - l_row['strike']) + net
-                                
+                c_far = process_chain(stock.option_chain(far_d).calls, current_price, far_days, 'call')
+                c_near = process_chain(stock.option_chain(near_d).calls, current_price, near_days, 'call')
+                
+                if strat_code == 'PMCC':
+                    longs = c_far[c_far['delta'] > 0.8]
+                    shorts = c_near[(c_near['delta'] > 0.2) & (c_near['delta'] < 0.4)]
+                    for _, l in longs.iterrows():
+                        valid_shorts = shorts[shorts['strike'] > l['strike']]
+                        for _, s in valid_shorts.iterrows():
+                            debit = l['ask'] - s['bid']
+                            if debit < (s['strike'] - l['strike']):
                                 all_opps.append({
-                                    'expiration_date': date, 'days_to_exp': days,
-                                    'desc': f"BUY 1 CALL ${l_row['strike']} / SELL 2 CALLs ${s_row['strike']}",
-                                    'price_display': net, # 正数代表收钱
-                                    'capital': s_row['strike'] * 100 * 0.3, # 裸卖风险保证金估算
-                                    'roi': profit_peak * 100 / (s_row['strike'] * 100 * 0.3), # 这是一个很虚的ROI
-                                    'breakeven': f"上方 ${s_row['strike'] + profit_peak:.2f}",
-                                    'special_note': "🔥 裸卖风险 (Unlimited Risk)",
-                                    'legs': [
-                                        {'side': 'BUY (x1)', 'type': 'CALL', 'strike': l_row['strike']},
-                                        {'side': 'SELL (x2)', 'type': 'CALL', 'strike': s_row['strike']}
-                                    ]
+                                    'expiration_date': f"Near: {near_d} / Far: {far_d}", 'days_to_exp': near_days,
+                                    'desc': f"BUY LEAPS ${l['strike']} / SELL CALL ${s['strike']}",
+                                    'price_display': debit, 'capital': debit*100, 'roi': 0, 'delta': l['delta'] - s['delta'],
+                                    'breakeven': f"${l['strike'] + debit:.2f}",
+                                    'legs': [{'side':'BUY', 'type':'CALL', 'strike':l['strike']}, {'side':'SELL', 'type':'CALL', 'strike':s['strike']}]
+                                })
+                
+                elif strat_code == 'CALENDAR':
+                    atm_strikes = c_near[abs(c_near['delta'] - 0.5) < 0.1]['strike']
+                    for k in atm_strikes:
+                        l = c_far[c_far['strike'] == k]
+                        s = c_near[c_near['strike'] == k]
+                        if not l.empty and not s.empty:
+                            debit = l.iloc[0]['ask'] - s.iloc[0]['bid']
+                            if debit > 0:
+                                all_opps.append({
+                                    'expiration_date': f"Short: {near_d} / Long: {far_d}", 'days_to_exp': near_days,
+                                    'desc': f"SELL CALL ${k} ({near_d}) / BUY CALL ${k} ({far_d})",
+                                    'price_display': debit, 'capital': debit*100, 'roi': 0, 'delta': 0, 'breakeven': "N/A",
+                                    'legs': [{'side':'SELL', 'type':'CALL', 'strike':k}, {'side':'BUY', 'type':'CALL', 'strike':k}]
                                 })
 
-            except Exception as e: continue
+        # === 同期策略逻辑 ===
+        else:
+            # 筛选日期
+            target_dates = []
+            for d_str, days in date_map:
+                if "LEAPS" in strat_code:
+                    if days > 180: target_dates.append((d_str, days))
+                elif strat_code in ['CSP', 'CC', 'BULL_PUT', 'IRON_CONDOR', 'JADE_LIZARD']:
+                    if 14 <= days <= 60: target_dates.append((d_str, days))
+                else: # 博弈类
+                    if 7 <= days <= 45: target_dates.append((d_str, days))
 
-        if not all_opps: return None, current_price, history, "未找到符合宗师级风控的套利机会"
+            lower = current_price * (1 - strike_range_pct/100)
+            upper = current_price * (1 + strike_range_pct/100)
+
+            for date, days in target_dates:
+                try:
+                    opt = stock.option_chain(date)
+                    calls = process_chain(opt.calls, current_price, days, 'call')
+                    puts = process_chain(opt.puts, current_price, days, 'put')
+                    
+                    # 范围过滤
+                    calls = calls[(calls['strike'] >= lower) & (calls['strike'] <= upper)]
+                    puts = puts[(puts['strike'] >= lower) & (puts['strike'] <= upper)]
+
+                    # 1. 基础单腿
+                    if strat_code == 'CSP':
+                        df = puts[(puts['delta'] > -0.35) & (puts['delta'] < -0.15)]
+                        for _, r in df.iterrows():
+                            all_opps.append({
+                                'expiration_date': date, 'days_to_exp': days, 'desc': f"SELL PUT ${r['strike']}",
+                                'price_display': r['bid'], 'capital': r['strike']*100, 'roi': r['bid']/r['strike'],
+                                'delta': r['delta'], 'breakeven': f"${r['strike']-r['bid']:.2f}",
+                                'legs': [{'side':'SELL', 'type':'PUT', 'strike':r['strike']}]
+                            })
+                    
+                    elif strat_code == 'CC':
+                        df = calls[(calls['delta'] < 0.35) & (calls['delta'] > 0.15)]
+                        for _, r in df.iterrows():
+                            all_opps.append({
+                                'expiration_date': date, 'days_to_exp': days, 'desc': f"SELL CALL ${r['strike']}",
+                                'price_display': r['bid'], 'capital': current_price*100, 'roi': r['bid']/current_price,
+                                'delta': r['delta'], 'breakeven': f"${current_price-r['bid']:.2f}",
+                                'legs': [{'side':'SELL', 'type':'CALL', 'strike':r['strike']}]
+                            })
+
+                    elif strat_code == 'LONG_CALL':
+                        df = calls[(calls['delta'] > 0.4) & (calls['delta'] < 0.6)]
+                        for _, r in df.iterrows():
+                            all_opps.append({
+                                'expiration_date': date, 'days_to_exp': days, 'desc': f"BUY CALL ${r['strike']}",
+                                'price_display': r['ask'], 'capital': r['ask']*100, 'roi': (current_price/r['ask'])*0.5,
+                                'delta': r['delta'], 'breakeven': f"${r['strike']+r['ask']:.2f}",
+                                'legs': [{'side':'BUY', 'type':'CALL', 'strike':r['strike']}]
+                            })
+                            
+                    elif strat_code == 'LONG_PUT':
+                        df = puts[(puts['delta'] > -0.6) & (puts['delta'] < -0.4)]
+                        for _, r in df.iterrows():
+                            all_opps.append({
+                                'expiration_date': date, 'days_to_exp': days, 'desc': f"BUY PUT ${r['strike']}",
+                                'price_display': r['ask'], 'capital': r['ask']*100, 'roi': (current_price/r['ask'])*0.5,
+                                'delta': r['delta'], 'breakeven': f"${r['strike']-r['ask']:.2f}",
+                                'legs': [{'side':'BUY', 'type':'PUT', 'strike':r['strike']}]
+                            })
+
+                    elif strat_code == 'LEAPS_CALL':
+                        df = calls[calls['delta'] > 0.85]
+                        for _, r in df.iterrows():
+                            all_opps.append({
+                                'expiration_date': date, 'days_to_exp': days, 'desc': f"BUY LEAPS ${r['strike']}",
+                                'price_display': r['ask'], 'capital': r['ask']*100, 'roi': 0,
+                                'delta': r['delta'], 'breakeven': f"${r['strike']+r['ask']:.2f}",
+                                'legs': [{'side':'BUY', 'type':'CALL', 'strike':r['strike']}]
+                            })
+
+                    # 2. 垂直价差
+                    elif strat_code == 'BULL_PUT':
+                        shorts = puts[(puts['delta'] > -0.4) & (puts['delta'] < -0.2)]
+                        res = build_spread(puts, shorts, spread_width, 'credit')
+                        if not res.empty:
+                            for _, r in res.iterrows():
+                                r.update({'expiration_date': date, 'days_to_exp': days})
+                                all_opps.append(r)
+
+                    elif strat_code == 'BEAR_CALL':
+                        shorts = calls[(calls['delta'] < 0.4) & (calls['delta'] > 0.2)]
+                        res = build_spread(calls, shorts, spread_width, 'credit')
+                        if not res.empty:
+                            for _, r in res.iterrows():
+                                r.update({'expiration_date': date, 'days_to_exp': days})
+                                all_opps.append(r)
+
+                    # 3. 组合策略 (Iron Condor / Jade Lizard / Ratio)
+                    elif strat_code == 'IRON_CONDOR':
+                        # 简化构建
+                        p_s = puts[(puts['delta'] > -0.25) & (puts['delta'] < -0.15)]
+                        c_s = calls[(calls['delta'] < 0.25) & (calls['delta'] > 0.15)]
+                        p_spr = build_spread(puts, p_s, spread_width, 'credit')
+                        c_spr = build_spread(calls, c_s, spread_width, 'credit')
+                        if not p_spr.empty and not c_spr.empty:
+                            p = p_spr.iloc[0]; c = c_spr.iloc[0]
+                            net = p['price_display'] + c['price_display']
+                            loss = spread_width - net
+                            if loss > 0:
+                                all_opps.append({
+                                    'expiration_date': date, 'days_to_exp': days,
+                                    'desc': f"IC Put ${p['legs'][0]['strike']} / Call ${c['legs'][0]['strike']}",
+                                    'price_display': net, 'capital': loss*100, 'roi': net/loss,
+                                    'delta': p['delta'] + c['delta'], 'breakeven': f"${p['legs'][0]['strike']-net:.1f}/${c['legs'][0]['strike']+net:.1f}",
+                                    'legs': p['legs'] + c['legs']
+                                })
+
+                    elif strat_code == 'JADE_LIZARD':
+                        # Sell Put + Bear Call Spread
+                        s_p = puts[(puts['delta'] > -0.3) & (puts['delta'] < -0.2)]
+                        s_c = calls[(calls['delta'] < 0.3) & (calls['delta'] > 0.2)]
+                        c_spr = build_spread(calls, s_c, spread_width, 'credit')
+                        if not s_p.empty and not c_spr.empty:
+                            p = s_p.iloc[0]; c = c_spr.iloc[0]
+                            net = p['bid'] + c['price_display']
+                            # 验证无风险
+                            if net > spread_width - 0.5: # 接近无风险
+                                all_opps.append({
+                                    'expiration_date': date, 'days_to_exp': days,
+                                    'desc': f"JL Put ${p['strike']} + Call Spr ${c['legs'][0]['strike']}",
+                                    'price_display': net, 'capital': p['strike']*100*0.2, 'roi': 0,
+                                    'delta': p['delta'] + c['delta'], 'breakeven': f"Down ${p['strike']-net:.1f}",
+                                    'legs': [{'side':'SELL','type':'PUT','strike':p['strike']}] + c['legs']
+                                })
+
+                    elif strat_code == 'RATIO':
+                        # Buy 1 ATM Call / Sell 2 OTM Calls
+                        l_c = calls[(calls['delta'] > 0.55) & (calls['delta'] < 0.65)]
+                        for _, l in l_c.iterrows():
+                            target = l['strike'] + spread_width
+                            s_c = calls[abs(calls['strike'] - target) < 1.0]
+                            if not s_c.empty:
+                                s = s_c.iloc[0]
+                                net = s['bid']*2 - l['ask']
+                                if net > -0.5:
+                                    all_opps.append({
+                                        'expiration_date': date, 'days_to_exp': days,
+                                        'desc': f"Ratio Buy ${l['strike']} / Sell 2x ${s['strike']}",
+                                        'price_display': net, 'capital': s['strike']*100*0.2, 'roi': 0,
+                                        'delta': l['delta'] - 2*s['delta'], 'breakeven': "Unlimited Downside Risk",
+                                        'legs': [{'side':'BUY','type':'CALL','strike':l['strike']}, {'side':'SELL x2','type':'CALL','strike':s['strike']}]
+                                    })
+                                    
+                    elif strat_code == 'STRADDLE':
+                        atm_c = calls.iloc[(calls['delta'] - 0.5).abs().argsort()[:1]]
+                        atm_p = puts.iloc[(puts['delta'].abs() - 0.5).abs().argsort()[:1]]
+                        if not atm_c.empty:
+                            c = atm_c.iloc[0]; p = atm_p.iloc[0]
+                            cost = c['ask'] + p['ask']
+                            all_opps.append({
+                                'expiration_date': date, 'days_to_exp': days,
+                                'desc': f"STRADDLE ${c['strike']}",
+                                'price_display': cost, 'capital': cost*100, 'roi': 0,
+                                'delta': c['delta'] + p['delta'], 'breakeven': f"±${cost:.2f}",
+                                'legs': [{'side':'BUY','type':'CALL','strike':c['strike']}, {'side':'BUY','type':'PUT','strike':p['strike']}]
+                            })
+
+                except: continue
+
+        if not all_opps: return None, current_price, history, next_earnings, "未扫描到符合策略逻辑的期权"
         df = pd.DataFrame(all_opps)
-        return df, current_price, history, None
+        # 年化处理
+        df['annualized_return'] = df.apply(lambda x: x['roi'] * (365/x['days_to_exp']) if x['roi']>0 else 0, axis=1)
+        return df, current_price, history, next_earnings, None
 
-    except Exception as e: return None, 0, None, f"API 错误: {str(e)}"
+    except Exception as e: return None, 0, None, None, f"API 错误: {str(e)}"
+
+def render_chart(history_df, ticker, r):
+    fig = go.Figure(data=[go.Candlestick(x=history_df.index, open=history_df['Open'], high=history_df['High'], low=history_df['Low'], close=history_df['Close'], name=ticker)])
+    cp = history_df['Close'].iloc[-1]
+    fig.add_hline(y=cp, line_dash="dot", line_color="gray", annotation_text="现价")
+    
+    # 画所有腿
+    for leg in r['legs']:
+        col = "red" if "SELL" in leg['side'] else "green"
+        fig.add_hline(y=leg['strike'], line_color=col, line_dash="dash")
+    
+    fig.update_layout(height=350, margin=dict(l=20, r=20, t=20, b=20), xaxis_rangeslider_visible=False, template="plotly_dark")
+    st.plotly_chart(fig, use_container_width=True)
 
 # --- 4. 界面渲染 ---
 
 with st.sidebar:
-    st.header("🐉 宗师级工场")
+    st.header("♾️ 终极军火库")
     
-    strat_map = {
-        "🦎 玉蜥蜴 (Jade Lizard - 无惧暴涨)": "JADE_LIZARD",
-        "⚖️ 比例价差 (Ratio Spread - 空手套白狼)": "RATIO_SPREAD"
-    }
+    # 重新设计的分类系统
+    category = st.selectbox("1. 选择作战战区", [
+        "🛡️ 现金流区 (Income)", 
+        "⚔️ 方向博弈 (Speculation)", 
+        "⚖️ 结构化/套利 (Advanced)", 
+        "⏳ 跨期时间 (Time)",
+        "📈 长期投资 (Long Term)"
+    ])
     
-    selected = st.selectbox("选择宗师策略", list(strat_map.keys()))
-    strat_code = strat_map[selected]
+    strat_map = {}
+    if "现金流" in category:
+        strat_map = {"CSP (卖Put)": "CSP", "CC (卖Call)": "CC", "Bull Put Spread": "BULL_PUT", "Bear Call Spread": "BEAR_CALL", "Iron Condor": "IRON_CONDOR"}
+    elif "博弈" in category:
+        strat_map = {"Long Call": "LONG_CALL", "Long Put": "LONG_PUT", "Straddle (双买)": "STRADDLE"}
+    elif "结构化" in category:
+        strat_map = {"Jade Lizard (玉蜥蜴)": "JADE_LIZARD", "Ratio Spread (比例)": "RATIO"}
+    elif "跨期" in category:
+        strat_map = {"PMCC (穷人盖楼)": "PMCC", "Calendar (日历)": "CALENDAR"}
+    else:
+        strat_map = {"LEAPS Call": "LEAPS_CALL"}
+
+    s_name = st.radio("2. 选择具体战术", list(strat_map.keys()))
+    strat_code = strat_map[s_name]
     
-    st.info("💡 **策略说明**：\n\n**玉蜥蜴**：稍微看涨/横盘。如果暴涨，因为你的权利金够厚，抵消了空头亏损。\n\n**比例价差**：买1卖2。如果温和上涨赚最多；如果跌了，白赚权利金；唯独怕暴涨。")
-    
-    spread_width = st.slider("结构宽度 / 间距", 2, 20, 5)
-    
+    spread_width = 5
+    if strat_code in ['BULL_PUT', 'BEAR_CALL', 'IRON_CONDOR', 'JADE_LIZARD', 'RATIO']:
+        spread_width = st.slider("价差宽度 / 间距", 1, 20, 5)
+
     st.divider()
     ticker = st.text_input("代码", value="NVDA").upper()
-    if st.button("🚀 寻找套利机会", type="primary", use_container_width=True):
+    strike_range_pct = st.slider("扫描范围", 5, 50, 20)
+    
+    if st.button("🚀 启动全能引擎", type="primary", use_container_width=True):
         st.cache_data.clear()
 
-st.title(f"{ticker} 结构化套利终端 v14.0")
+st.title(f"{ticker} 策略终端 v15.0")
 
-with st.spinner('正在进行多腿对冲计算...'):
-    df, current_price, history, err = fetch_market_data(ticker, strat_code, spread_width, 0)
+with st.spinner(f'正在构建 {s_name} 策略矩阵...'):
+    df, current_price, history, next_earnings, err = fetch_market_data(ticker, strat_code, spread_width, strike_range_pct)
 
 if err:
     st.error(err)
 else:
-    # 推荐逻辑
-    if strat_code == 'JADE_LIZARD':
-        # 找上方风险最小的 (upside_risk 越小越好，即 price_display 越大越好)
-        best = df.sort_values('price_display', ascending=False).head(1)
-    else:
-        # 找收钱最多的 Ratio
-        best = df.sort_values('price_display', ascending=False).head(1)
+    # 智能推荐排序
+    if "现金流" in category: best = df.sort_values('annualized_return', ascending=False).head(1)
+    elif "博弈" in category: best = df.sort_values('roi', ascending=False).head(1) # 这里 roi 存的是杠杆
+    elif "结构化" in category: best = df.sort_values('price_display', ascending=False).head(1) # 找收钱最多的
+    else: best = df.head(1)
 
     if not best.empty:
         r = best.iloc[0]
-        
         c1, c2 = st.columns([1.5, 1])
         with c1:
-            st.subheader("🏆 最佳套利结构")
-            st.markdown(f"**合约时间**: {r['expiration_date']} (剩 {r['days_to_exp']} 天)")
+            st.subheader("🏆 最佳战术指令")
+            if next_earnings:
+                exp_dt = datetime.strptime(r['expiration_date'].split(' ')[-1] if 'Near' in r['expiration_date'] else r['expiration_date'], "%Y-%m-%d").date()
+                if next_earnings <= exp_dt: st.warning(f"⚠️ 包含财报风险 ({next_earnings})")
+                else: st.success("🛡️ 无财报风险")
+
+            st.markdown(f"**合约**: {r['expiration_date']}")
             
-            # 动态显示 Note
-            if "无忧" in str(r['special_note']):
-                st.success(r['special_note'])
-            else:
-                st.warning(r['special_note'])
-            
-            # 显示多腿
+            # 显示腿
             for leg in r['legs']:
-                color = "sell-leg" if "SELL" in leg['side'] else "buy-leg"
-                st.markdown(f'<div class="trade-leg {color}">{leg["side"]} {leg["type"]} ${leg["strike"]}</div>', unsafe_allow_html=True)
+                c = "sell-leg" if "SELL" in leg['side'] else "buy-leg"
+                st.markdown(f'<div class="trade-leg {c}">{leg["side"]} {leg["type"]} ${leg["strike"]}</div>', unsafe_allow_html=True)
 
         with c2:
-            lbl = "净收入 (Credit)"
-            val = r['price_display']
-            st.metric(lbl, f"${val*100:.0f}")
-            st.metric("估算保证金", f"${r['capital']:.0f}")
-            st.metric("主要盈亏平衡点", r['breakeven'])
+            lbl = "净支出" if r['price_display'] > 0 and category in ["博弈", "跨期", "长期"] else "净收入" 
+            # 注意：上面代码逻辑为了简化，有些 debit 策略的 price_display 也是正数，这里简单展示数值
+            st.metric("单张金额", f"${abs(r['price_display'])*100:.0f}")
+            st.metric("资金/风险", f"${r['capital']:.0f}")
+            st.metric("盈亏平衡", r['breakeven'])
 
-    # 画图 (简单版)
-    fig = go.Figure(data=[go.Candlestick(x=history.index, open=history['Open'], high=history['High'], low=history['Low'], close=history['Close'], name=ticker)])
-    fig.add_hline(y=current_price, line_dash="dot", line_color="gray", annotation_text="现价")
-    # 画主要腿
-    if not best.empty:
-        main_leg = r['legs'][0]['strike']
-        fig.add_hline(y=main_leg, line_color="orange", annotation_text="核心行权价")
-    
-    fig.update_layout(height=350, template="plotly_dark", xaxis_rangeslider_visible=False)
-    st.plotly_chart(fig, use_container_width=True)
-
+    if history is not None:
+        render_chart(history, ticker, r)
+        
     st.divider()
-    with st.expander("📋 完整套利列表"):
-        st.dataframe(df[['expiration_date', 'desc', 'price_display', 'special_note', 'breakeven']], use_container_width=True)
+    with st.expander("📋 完整策略列表"):
+        st.dataframe(df, use_container_width=True)
