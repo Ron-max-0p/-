@@ -7,9 +7,9 @@ import numpy as np
 
 # --- 1. 页面配置 ---
 st.set_page_config(
-    page_title="美股收租工厂 (日期推荐版)", 
+    page_title="蟹黄包子铺", 
     layout="wide", 
-    page_icon="🏭",
+    page_icon="🛡️", # 图标换成了盾牌
     initial_sidebar_state="expanded"
 )
 
@@ -25,10 +25,12 @@ st.markdown("""
     }
     thead tr th:first-child {display:none}
     tbody th {display:none}
-    /* 调整一下推荐卡片的样式 */
-    .stInfo {
+    /* 强调核查区域 */
+    .stCheckbox {
         background-color: #262730;
-        border: 1px solid #4B4B4B;
+        padding: 10px;
+        border-radius: 5px;
+        margin-bottom: 5px;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -51,7 +53,6 @@ def fetch_market_data(ticker, min_days, max_days, strategy_type, spread_width, s
         for date_str in expirations:
             exp_date = datetime.strptime(date_str, "%Y-%m-%d").date()
             days_to_exp = (exp_date - today).days
-            # 这里放宽一点获取范围，为了能凑齐三个时间段
             if 0 <= days_to_exp <= 180:
                 valid_dates.append((date_str, days_to_exp))
         
@@ -145,7 +146,7 @@ def render_chart(history_df, ticker, target_strike=None):
 # --- 4. 界面渲染区 ---
 
 with st.sidebar:
-    st.header("🏭 策略参数")
+    st.header("🛡️ 风控指挥部")
     cat_map = {
         "🔰 入门收租 (单腿)": ["CSP (现金担保Put)", "CC (持股备兑Call)"],
         "🚀 进阶杠杆 (垂直价差)": ["Bull Put Spread (牛市看跌价差)"]
@@ -164,99 +165,96 @@ with st.sidebar:
     ticker_key = st.selectbox("选择标的", list(preset_tickers.keys()) + ["自定义..."])
     ticker = st.text_input("代码", value="AMD").upper() if ticker_key == "自定义..." else preset_tickers[ticker_key]
     
-    # 删除了 min_dte/max_dte 的手动输入，由系统自动分段推荐
-    st.info("💡 系统将自动扫描 **短期、中期、长期** 的最佳机会。")
-    
     strike_range_pct = st.slider("行权价扫描范围 (±%)", 10, 40, 20)
     
-    if st.button("🚀 寻找最佳日期", type="primary", use_container_width=True):
+    if st.button("🚀 寻找实战机会", type="primary", use_container_width=True):
         st.cache_data.clear()
 
 # --- 主界面 ---
-st.title(f"📅 {ticker} 最佳日期精选")
+st.title(f"🛡️ {ticker} 实战风控终端")
 
-with st.spinner('AI 正在对比不同日期的期权链...'):
-    # 直接拉取未来 180 天的数据
+with st.spinner('AI 正在扫描并执行风控检查...'):
     df, current_price, history, error_msg = fetch_market_data(ticker, 0, 180, strat_code, spread_width, strike_range_pct)
 
 if error_msg:
     st.error(error_msg)
 else:
-    # --- 核心：时间锦囊逻辑 ---
+    # 筛选逻辑
     df['score_val'] = df['distance_pct'] * 100
-    
-    # 定义筛选标准：我们要找年化高，且安全垫适中（不至于太激进）
     if strat_code == 'SPREAD':
-        safe_df = df[(df['score_val'] >= 2)] # 价差稍微激进点
+        safe_df = df[(df['score_val'] >= 2)]
     else:
-        safe_df = df[(df['score_val'] >= 5)] # 单腿至少5%安全垫
+        safe_df = df[(df['score_val'] >= 5)]
     
-    # 分桶
-    short_term = safe_df[(safe_df['days_to_exp'] <= 14)].sort_values('annualized_return', ascending=False).head(1)
+    # 选出黄金月度作为首选
     mid_term = safe_df[(safe_df['days_to_exp'] > 14) & (safe_df['days_to_exp'] <= 45)].sort_values('annualized_return', ascending=False).head(1)
-    long_term = safe_df[(safe_df['days_to_exp'] > 45)].sort_values('annualized_return', ascending=False).head(1)
 
-    # 用来画图的 Target Strike (默认选中期)
     target_strike_line = None
     if not mid_term.empty:
         target_strike_line = mid_term.iloc[0]['strike']
-    elif not short_term.empty:
-        target_strike_line = short_term.iloc[0]['strike']
 
-    # 1. 顶部图表
+    # 1. K线图
     if history is not None:
         render_chart(history, ticker, target_strike_line)
 
-    # 2. 三大时间锦囊卡片
-    st.subheader("🤖 AI 日期推荐")
+    # 2. 核心：带风控的推荐卡片
+    st.subheader("👮‍♂️ 交易前核查 (Pre-Trade Checklist)")
     
-    col1, col2, col3 = st.columns(3)
-
-    def render_date_card(col, title, emoji, data):
-        if data.empty:
-            col.warning(f"{emoji} {title}\n\n暂无合适机会")
-            return
+    if not mid_term.empty:
+        row = mid_term.iloc[0]
         
-        row = data.iloc[0]
-        with col:
-            st.markdown(f"### {emoji} {title}")
-            st.markdown(f"**{row['expiration_date']}** (剩{row['days_to_exp']}天)")
-            st.divider()
-            st.markdown(f"🎯 行权价: **${row['strike']}**")
-            st.markdown(f"💰 权利金: **${row['bid']*100:.0f}**")
-            st.markdown(f"🛡️ 安全垫: **{row['distance_pct']:.1%}**")
-            st.markdown(f"🚀 年化: :red[**{row['annualized_return']:.1%}**]")
+        # 使用两列布局：左边是推荐，右边是检查表
+        c1, c2 = st.columns([1, 1.5])
+        
+        with c1:
+            st.info(f"""
+            **🏆 系统推荐 (黄金月度)**
             
-            # 动态点评
-            if title == "短线闪击":
-                st.caption("⚡ 适合赚快钱，但要盯盘，小心财报风险。")
-            elif title == "黄金月度":
-                st.caption("🏆 性价比之王，Theta衰减最快，推荐首选。")
+            📅 **到期**: {row['expiration_date']} (剩{row['days_to_exp']}天)
+            🎯 **行权**: ${row['strike']}
+            💰 **参考权利金**: ${row['bid']*100:.0f}
+            🛡️ **安全垫**: {row['distance_pct']:.1%}
+            🚀 **年化**: {row['annualized_return']:.1%}
+            """)
+        
+        with c2:
+            st.warning("⚠️ 必须完成以下核查，才可执行交易！")
+            
+            check1 = st.checkbox(f"1. 已在券商确认 **${ticker}** 实时股价 ({current_price:.2f}) 无巨大偏差")
+            check2 = st.checkbox(f"2. 已确认该合约 **Delta 绝对值 < 0.3** (胜率较高)")
+            check3 = st.checkbox(f"3. 已确认 **{row['expiration_date']}** 之前无财报发布")
+            
+            if check1 and check2 and check3:
+                st.success(f"""
+                ✅ **风控通过！建议执行方案：**
+                
+                👉 打开券商 App
+                👉 搜索期权链: **{row['expiration_date']}**
+                👉 选择 Strike: **{row['strike']}**
+                👉 **Limit Order (限价单)** 挂在 **${row['bid']:.2f}** 附近
+                """)
             else:
-                st.caption("🧘 适合佛系收租，睡得香，不用天天看。")
+                st.markdown("🚨 *请逐项勾选上方检查项以解锁交易建议*")
 
-    render_date_card(col1, "短线闪击", "⚡", short_term)
-    render_date_card(col2, "黄金月度", "🏆", mid_term)
-    render_date_card(col3, "远期躺平", "🧘", long_term)
+    else:
+        st.error("当前筛选条件下，未找到足够安全的“黄金月度”机会。建议调整侧边栏的扫描范围。")
 
-    # 3. 详细表格
+    # 3. 详细数据表
     st.divider()
-    st.subheader("📋 所有数据")
-    
-    final_df = df.copy()
-    if 'display_strike' in final_df.columns:
-        final_df['strike'] = final_df['display_strike']
+    with st.expander("📋 查看所有原始数据 (点击展开)"):
+        final_df = df.copy()
+        if 'display_strike' in final_df.columns:
+            final_df['strike'] = final_df['display_strike']
 
-    st.dataframe(
-        final_df[['expiration_date', 'strike', 'bid', 'distance_pct', 'annualized_return']],
-        column_config={
-            "expiration_date": st.column_config.DateColumn("具体日期"),
-            "strike": st.column_config.TextColumn("行权价"),
-            "bid": st.column_config.NumberColumn("权利金", format="$%.2f"),
-            "distance_pct": st.column_config.ProgressColumn("安全垫", format="%.2f%%", min_value=-0.2, max_value=0.2),
-            "annualized_return": st.column_config.NumberColumn("年化收益", format="%.2f%%"),
-        },
-        use_container_width=True,
-        hide_index=True,
-        height=600
-    )
+        st.dataframe(
+            final_df[['expiration_date', 'strike', 'bid', 'distance_pct', 'annualized_return']],
+            column_config={
+                "expiration_date": st.column_config.DateColumn("日期"),
+                "strike": st.column_config.TextColumn("行权价"),
+                "bid": st.column_config.NumberColumn("权利金", format="$%.2f"),
+                "distance_pct": st.column_config.ProgressColumn("安全垫", format="%.2f%%", min_value=-0.2, max_value=0.2),
+                "annualized_return": st.column_config.NumberColumn("年化", format="%.2f%%"),
+            },
+            use_container_width=True,
+            hide_index=True
+        )
