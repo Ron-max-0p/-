@@ -8,7 +8,7 @@ import scipy.stats as si
 
 # --- 1. 页面配置 ---
 st.set_page_config(
-    page_title="美股期权终极军火库 (全集版)", 
+    page_title="美股期权终极军火库 (稳定版)", 
     layout="wide", 
     page_icon="♾️",
     initial_sidebar_state="expanded"
@@ -39,7 +39,6 @@ def process_chain(df, current_price, days_to_exp, type, risk_free_rate=0.045):
     T = days_to_exp / 365.0
     df['type'] = type
     df['delta'] = df.apply(lambda x: black_scholes_delta(current_price, x['strike'], T, risk_free_rate, x['impliedVolatility'], type), axis=1)
-    # 流动性初筛
     return df[(df['openInterest'] > 5) & (df['bid'] > 0)].copy()
 
 def get_earnings_date(ticker_obj):
@@ -55,8 +54,6 @@ def build_spread(longs, shorts, width, type='credit'):
     spreads = []
     for _, s in shorts.iterrows():
         target = s['strike'] - width if s['type']=='put' else s['strike'] + width
-        # Debit spread 逻辑相反，这里简化处理，主要服务 Credit Spread
-        
         matches = longs[abs(longs['strike'] - target) < 0.1]
         if not matches.empty:
             l = matches.iloc[0]
@@ -84,7 +81,6 @@ def fetch_market_data(ticker, strat_code, spread_width, strike_range_pct):
         expirations = stock.options
         if not expirations: return None, current_price, history, next_earnings, "无期权链"
 
-        # 日期预处理
         today = datetime.now().date()
         date_map = []
         for d_str in expirations:
@@ -140,14 +136,13 @@ def fetch_market_data(ticker, strat_code, spread_width, strike_range_pct):
 
         # === 同期策略逻辑 ===
         else:
-            # 筛选日期
             target_dates = []
             for d_str, days in date_map:
                 if "LEAPS" in strat_code:
                     if days > 180: target_dates.append((d_str, days))
                 elif strat_code in ['CSP', 'CC', 'BULL_PUT', 'IRON_CONDOR', 'JADE_LIZARD']:
                     if 14 <= days <= 60: target_dates.append((d_str, days))
-                else: # 博弈类
+                else: 
                     if 7 <= days <= 45: target_dates.append((d_str, days))
 
             lower = current_price * (1 - strike_range_pct/100)
@@ -159,7 +154,6 @@ def fetch_market_data(ticker, strat_code, spread_width, strike_range_pct):
                     calls = process_chain(opt.calls, current_price, days, 'call')
                     puts = process_chain(opt.puts, current_price, days, 'put')
                     
-                    # 范围过滤
                     calls = calls[(calls['strike'] >= lower) & (calls['strike'] <= upper)]
                     puts = puts[(puts['strike'] >= lower) & (puts['strike'] <= upper)]
 
@@ -214,63 +208,71 @@ def fetch_market_data(ticker, strat_code, spread_width, strike_range_pct):
                                 'legs': [{'side':'BUY', 'type':'CALL', 'strike':r['strike']}]
                             })
 
-                    # 2. 垂直价差
+                    # 2. 垂直价差 (重点修复：补全 days_to_exp)
                     elif strat_code == 'BULL_PUT':
                         shorts = puts[(puts['delta'] > -0.4) & (puts['delta'] < -0.2)]
                         res = build_spread(puts, shorts, spread_width, 'credit')
                         if not res.empty:
                             for _, r in res.iterrows():
-                                r.update({'expiration_date': date, 'days_to_exp': days})
-                                all_opps.append(r)
+                                # 修复：手动添加日期信息到字典
+                                r_dict = r.to_dict()
+                                r_dict.update({'expiration_date': date, 'days_to_exp': days})
+                                all_opps.append(r_dict)
 
                     elif strat_code == 'BEAR_CALL':
                         shorts = calls[(calls['delta'] < 0.4) & (calls['delta'] > 0.2)]
                         res = build_spread(calls, shorts, spread_width, 'credit')
                         if not res.empty:
                             for _, r in res.iterrows():
-                                r.update({'expiration_date': date, 'days_to_exp': days})
-                                all_opps.append(r)
+                                # 修复：手动添加日期信息到字典
+                                r_dict = r.to_dict()
+                                r_dict.update({'expiration_date': date, 'days_to_exp': days})
+                                all_opps.append(r_dict)
 
-                    # 3. 组合策略 (Iron Condor / Jade Lizard / Ratio)
+                    # 3. 组合策略
                     elif strat_code == 'IRON_CONDOR':
-                        # 简化构建
                         p_s = puts[(puts['delta'] > -0.25) & (puts['delta'] < -0.15)]
                         c_s = calls[(calls['delta'] < 0.25) & (calls['delta'] > 0.15)]
                         p_spr = build_spread(puts, p_s, spread_width, 'credit')
                         c_spr = build_spread(calls, c_s, spread_width, 'credit')
                         if not p_spr.empty and not c_spr.empty:
-                            p = p_spr.iloc[0]; c = c_spr.iloc[0]
-                            net = p['price_display'] + c['price_display']
-                            loss = spread_width - net
-                            if loss > 0:
-                                all_opps.append({
-                                    'expiration_date': date, 'days_to_exp': days,
-                                    'desc': f"IC Put ${p['legs'][0]['strike']} / Call ${c['legs'][0]['strike']}",
-                                    'price_display': net, 'capital': loss*100, 'roi': net/loss,
-                                    'delta': p['delta'] + c['delta'], 'breakeven': f"${p['legs'][0]['strike']-net:.1f}/${c['legs'][0]['strike']+net:.1f}",
-                                    'legs': p['legs'] + c['legs']
-                                })
+                            # 简单取 Top 3 组合
+                            p_list = p_spr.head(3).to_dict('records')
+                            c_list = c_spr.head(3).to_dict('records')
+                            
+                            for p in p_list:
+                                for c in c_list:
+                                    net = p['price_display'] + c['price_display']
+                                    loss = spread_width - net
+                                    if loss > 0:
+                                        all_opps.append({
+                                            'expiration_date': date, 'days_to_exp': days,
+                                            'desc': f"IC Put ${p['legs'][0]['strike']} / Call ${c['legs'][0]['strike']}",
+                                            'price_display': net, 'capital': loss*100, 'roi': net/loss,
+                                            'delta': p['delta'] + c['delta'], 
+                                            'breakeven': f"${p['legs'][0]['strike']-net:.1f}/${c['legs'][0]['strike']+net:.1f}",
+                                            'legs': p['legs'] + c['legs']
+                                        })
 
                     elif strat_code == 'JADE_LIZARD':
-                        # Sell Put + Bear Call Spread
                         s_p = puts[(puts['delta'] > -0.3) & (puts['delta'] < -0.2)]
                         s_c = calls[(calls['delta'] < 0.3) & (calls['delta'] > 0.2)]
                         c_spr = build_spread(calls, s_c, spread_width, 'credit')
                         if not s_p.empty and not c_spr.empty:
-                            p = s_p.iloc[0]; c = c_spr.iloc[0]
-                            net = p['bid'] + c['price_display']
-                            # 验证无风险
-                            if net > spread_width - 0.5: # 接近无风险
-                                all_opps.append({
-                                    'expiration_date': date, 'days_to_exp': days,
-                                    'desc': f"JL Put ${p['strike']} + Call Spr ${c['legs'][0]['strike']}",
-                                    'price_display': net, 'capital': p['strike']*100*0.2, 'roi': 0,
-                                    'delta': p['delta'] + c['delta'], 'breakeven': f"Down ${p['strike']-net:.1f}",
-                                    'legs': [{'side':'SELL','type':'PUT','strike':p['strike']}] + c['legs']
-                                })
+                            p = s_p.iloc[0]; 
+                            c_list = c_spr.to_dict('records')
+                            for c in c_list:
+                                net = p['bid'] + c['price_display']
+                                if net > spread_width - 0.5:
+                                    all_opps.append({
+                                        'expiration_date': date, 'days_to_exp': days,
+                                        'desc': f"JL Put ${p['strike']} + Call Spr ${c['legs'][0]['strike']}",
+                                        'price_display': net, 'capital': p['strike']*100*0.2, 'roi': 0,
+                                        'delta': p['delta'] + c['delta'], 'breakeven': f"Down ${p['strike']-net:.1f}",
+                                        'legs': [{'side':'SELL','type':'PUT','strike':p['strike']}] + c['legs']
+                                    })
 
                     elif strat_code == 'RATIO':
-                        # Buy 1 ATM Call / Sell 2 OTM Calls
                         l_c = calls[(calls['delta'] > 0.55) & (calls['delta'] < 0.65)]
                         for _, l in l_c.iterrows():
                             target = l['strike'] + spread_width
@@ -315,12 +317,9 @@ def render_chart(history_df, ticker, r):
     fig = go.Figure(data=[go.Candlestick(x=history_df.index, open=history_df['Open'], high=history_df['High'], low=history_df['Low'], close=history_df['Close'], name=ticker)])
     cp = history_df['Close'].iloc[-1]
     fig.add_hline(y=cp, line_dash="dot", line_color="gray", annotation_text="现价")
-    
-    # 画所有腿
     for leg in r['legs']:
         col = "red" if "SELL" in leg['side'] else "green"
         fig.add_hline(y=leg['strike'], line_color=col, line_dash="dash")
-    
     fig.update_layout(height=350, margin=dict(l=20, r=20, t=20, b=20), xaxis_rangeslider_visible=False, template="plotly_dark")
     st.plotly_chart(fig, use_container_width=True)
 
@@ -329,7 +328,6 @@ def render_chart(history_df, ticker, r):
 with st.sidebar:
     st.header("♾️ 终极军火库")
     
-    # 重新设计的分类系统
     category = st.selectbox("1. 选择作战战区", [
         "🛡️ 现金流区 (Income)", 
         "⚔️ 方向博弈 (Speculation)", 
@@ -364,7 +362,7 @@ with st.sidebar:
     if st.button("🚀 启动全能引擎", type="primary", use_container_width=True):
         st.cache_data.clear()
 
-st.title(f"{ticker} 策略终端 v15.0")
+st.title(f"{ticker} 策略终端 v15.1 (修复版)")
 
 with st.spinner(f'正在构建 {s_name} 策略矩阵...'):
     df, current_price, history, next_earnings, err = fetch_market_data(ticker, strat_code, spread_width, strike_range_pct)
@@ -372,10 +370,9 @@ with st.spinner(f'正在构建 {s_name} 策略矩阵...'):
 if err:
     st.error(err)
 else:
-    # 智能推荐排序
     if "现金流" in category: best = df.sort_values('annualized_return', ascending=False).head(1)
-    elif "博弈" in category: best = df.sort_values('roi', ascending=False).head(1) # 这里 roi 存的是杠杆
-    elif "结构化" in category: best = df.sort_values('price_display', ascending=False).head(1) # 找收钱最多的
+    elif "博弈" in category: best = df.sort_values('roi', ascending=False).head(1) 
+    elif "结构化" in category: best = df.sort_values('price_display', ascending=False).head(1)
     else: best = df.head(1)
 
     if not best.empty:
@@ -383,21 +380,28 @@ else:
         c1, c2 = st.columns([1.5, 1])
         with c1:
             st.subheader("🏆 最佳战术指令")
+            
+            # 修复财报检测逻辑：安全地处理日期格式
             if next_earnings:
-                exp_dt = datetime.strptime(r['expiration_date'].split(' ')[-1] if 'Near' in r['expiration_date'] else r['expiration_date'], "%Y-%m-%d").date()
-                if next_earnings <= exp_dt: st.warning(f"⚠️ 包含财报风险 ({next_earnings})")
-                else: st.success("🛡️ 无财报风险")
+                try:
+                    # 如果 expiration_date 包含 "Near" (跨期)，则取 Far Date 做检查
+                    exp_str = r['expiration_date'].split(' / ')[-1] if ' / ' in r['expiration_date'] else r['expiration_date']
+                    exp_str = exp_str.replace('Far: ', '').replace('Long: ', '')
+                    exp_dt = datetime.strptime(exp_str, "%Y-%m-%d").date()
+                    
+                    if next_earnings <= exp_dt: st.warning(f"⚠️ 包含财报风险 ({next_earnings})")
+                    else: st.success("🛡️ 无财报风险")
+                except:
+                    pass
 
             st.markdown(f"**合约**: {r['expiration_date']}")
             
-            # 显示腿
             for leg in r['legs']:
                 c = "sell-leg" if "SELL" in leg['side'] else "buy-leg"
                 st.markdown(f'<div class="trade-leg {c}">{leg["side"]} {leg["type"]} ${leg["strike"]}</div>', unsafe_allow_html=True)
 
         with c2:
             lbl = "净支出" if r['price_display'] > 0 and category in ["博弈", "跨期", "长期"] else "净收入" 
-            # 注意：上面代码逻辑为了简化，有些 debit 策略的 price_display 也是正数，这里简单展示数值
             st.metric("单张金额", f"${abs(r['price_display'])*100:.0f}")
             st.metric("资金/风险", f"${r['capital']:.0f}")
             st.metric("盈亏平衡", r['breakeven'])
