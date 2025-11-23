@@ -1,13 +1,13 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import plotly.graph_objects as go # 引入绘图库
+import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import numpy as np
 
 # --- 1. 页面配置 ---
 st.set_page_config(
-    page_title="美股收租工厂 (图表版)", 
+    page_title="美股收租工厂 (纯净版)", 
     layout="wide", 
     page_icon="🏭",
     initial_sidebar_state="expanded"
@@ -34,7 +34,6 @@ st.markdown("""
 def fetch_market_data(ticker, min_days, max_days, strategy_type, spread_width=5):
     try:
         stock = yf.Ticker(ticker)
-        # 获取更多历史数据用于画图
         history = stock.history(period="3mo") 
         if history.empty: return None, 0, None, "无法获取股价"
         current_price = history['Close'].iloc[-1]
@@ -86,7 +85,7 @@ def fetch_market_data(ticker, min_days, max_days, strategy_type, spread_width=5)
                             if net_credit > 0.01:
                                 max_loss = spread_width - net_credit
                                 spread_data = {
-                                    'strike': short_row['strike'], # 这里只存卖出的行权价，方便画图
+                                    'strike': short_row['strike'],
                                     'display_strike': f"{short_row['strike']} / {long_row['strike']}",
                                     'bid': net_credit,
                                     'distance_pct': (current_price - short_row['strike']) / current_price,
@@ -101,9 +100,9 @@ def fetch_market_data(ticker, min_days, max_days, strategy_type, spread_width=5)
                     candidates['days_to_exp'] = days
                     candidates['expiration_date'] = date
                     candidates = candidates[candidates['bid'] > 0.01] 
-                    # 简易胜率估算 (假设正态分布，很不严谨但看着直观)
-                    # 距离越远，胜率越高
-                    candidates['win_rate'] = 1 - (1 / (1 + np.exp(candidates['distance_pct'] * 20 - 2)))
+                    
+                    # >>> 删除了胜率估算，只保留确定性数学计算 <<<
+                    
                     candidates['annualized_return'] = candidates['roi'] * (365 / days)
                     all_opportunities.append(candidates)
                     
@@ -127,18 +126,15 @@ def render_chart(history_df, ticker, target_strike=None):
                 close=history_df['Close'],
                 name=ticker)])
 
-    # 画一条当前的股价线
     current_price = history_df['Close'].iloc[-1]
     fig.add_hline(y=current_price, line_dash="dot", annotation_text="现价", annotation_position="top right", line_color="gray")
 
-    # 如果有推荐的行权价，画一条红线
     if target_strike:
         fig.add_hline(y=target_strike, line_dash="dash", line_color="red", 
                       annotation_text=f"行权价 ${target_strike}", annotation_position="bottom right")
-        # 填充区域表示安全垫
-        if target_strike < current_price: # Put
+        if target_strike < current_price: 
             fig.add_hrect(y0=target_strike, y1=current_price, fillcolor="green", opacity=0.1, line_width=0)
-        else: # Call
+        else: 
             fig.add_hrect(y0=current_price, y1=target_strike, fillcolor="red", opacity=0.1, line_width=0)
 
     fig.update_layout(
@@ -181,13 +177,25 @@ with st.sidebar:
 # --- 主界面 ---
 st.title(f"📊 {ticker} 策略可视化")
 
+# 说明书
+expander_title = "📖 策略说明书 (点击展开)"
+help_text = ""
+if strat_code == 'CSP':
+    help_text = "### 🟢 Cash-Secured Put\n我是土豪，我有钱。如果跌到行权价，我愿意全款买入股票。"
+elif strat_code == 'CC':
+    help_text = "### 🔴 Covered Call\n我有股票。如果涨到行权价，我愿意卖出股票止盈。"
+else:
+    help_text = f"### 🚀 Bull Put Spread\n用小资金收租。卖出一个贵的Put，买入一个便宜的Put做保护。最大亏损锁定为 ${spread_width*100}。"
+
+with st.expander(expander_title):
+    st.markdown(help_text)
+
 with st.spinner('正在获取数据并绘图...'):
     df, current_price, history, error_msg = fetch_market_data(ticker, 14, 45, strat_code, spread_width)
 
 if error_msg:
     st.error(error_msg)
 else:
-    # 智能筛选逻辑
     df['score_val'] = df['distance_pct'] * 100
     if strat_code == 'SPREAD':
         rec_col = 'annualized_return'
@@ -195,37 +203,33 @@ else:
     else:
         best_pick = df[(df['score_val'] >= 4) & (df['score_val'] < 10)].sort_values('annualized_return', ascending=False).head(1)
     
-    # 获取最佳推荐的行权价，用于画图
     target_strike_line = None
     if not best_pick.empty:
         target_strike_line = best_pick.iloc[0]['strike']
 
-    # >>> 核心新功能：画图 <<<
     if history is not None:
         render_chart(history, ticker, target_strike_line)
 
-    # 推荐卡片
     if not best_pick.empty:
         r = best_pick.iloc[0]
-        st.success(f"🤖 **AI 推荐**: 行权价 **${r['strike']}** | 年化 **{r['annualized_return']:.1%}** | 胜率预估 **{r['win_rate']:.1%}**")
+        # 删除了胜率显示，只保留硬数据
+        st.success(f"🤖 **AI 推荐**: 行权价 **${r['strike']}** | 年化收益 **{r['annualized_return']:.1%}** | 安全垫 **{r['distance_pct']:.1%}**")
 
-    # 列表展示
     st.divider()
-    st.subheader("📋 机会列表")
+    st.subheader("📋 机会列表 (纯净数据)")
     
-    # 处理一下显示列
     final_df = df.copy()
     if 'display_strike' in final_df.columns:
         final_df['strike'] = final_df['display_strike']
 
+    # 表格里也删除了 win_rate 列
     st.dataframe(
-        final_df[['expiration_date', 'strike', 'bid', 'distance_pct', 'win_rate', 'annualized_return']],
+        final_df[['expiration_date', 'strike', 'bid', 'distance_pct', 'annualized_return']],
         column_config={
             "expiration_date": st.column_config.DateColumn("到期日"),
             "strike": st.column_config.TextColumn("行权价"),
             "bid": st.column_config.NumberColumn("权利金", format="$%.2f"),
             "distance_pct": st.column_config.ProgressColumn("安全垫", format="%.2f%%", min_value=-0.1, max_value=0.2),
-            "win_rate": st.column_config.ProgressColumn("胜率预估", format="%.0f%%", min_value=0, max_value=1),
             "annualized_return": st.column_config.NumberColumn("年化收益", format="%.2f%%"),
         },
         use_container_width=True,
