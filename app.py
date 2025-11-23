@@ -146,7 +146,7 @@ def render_chart(history_df, ticker, target_strike=None):
 # --- 4. 界面渲染区 ---
 
 with st.sidebar:
-    st.header("🛡️ 风控指挥部")
+    st.header("风控")
     cat_map = {
         "🔰 入门收租 (单腿)": ["CSP (现金担保Put)", "CC (持股备兑Call)"],
         "🚀 进阶杠杆 (垂直价差)": ["Bull Put Spread (牛市看跌价差)"]
@@ -241,7 +241,7 @@ else:
 
     # 3. 详细数据表
     st.divider()
-    with st.expander("📋 查看所有原始数据 (点击展开)"):
+    with st.expander("查看所有原始数据 (点击展开)"):
         final_df = df.copy()
         if 'display_strike' in final_df.columns:
             final_df['strike'] = final_df['display_strike']
@@ -258,3 +258,4 @@ else:
             use_container_width=True,
             hide_index=True
         )
+
