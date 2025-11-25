@@ -326,14 +326,14 @@ def render_chart(history_df, ticker, r):
 # --- 4. 界面渲染 ---
 
 with st.sidebar:
-    st.header("♾️ 终极军火库")
+    st.header("包子类型")
     
-    category = st.selectbox("1. 选择作战战区", [
-        "🛡️ 现金流区 (Income)", 
-        "⚔️ 方向博弈 (Speculation)", 
-        "⚖️ 结构化/套利 (Advanced)", 
-        "⏳ 跨期时间 (Time)",
-        "📈 长期投资 (Long Term)"
+    category = st.selectbox("1. 选择你爱的口味", [
+        "现金流区 (Income)", 
+        "方向博弈 (Speculation)", 
+        "结构化/套利 (Advanced)", 
+        "跨期时间 (Time)",
+        "长期投资 (Long Term)"
     ])
     
     strat_map = {}
@@ -348,7 +348,7 @@ with st.sidebar:
     else:
         strat_map = {"LEAPS Call": "LEAPS_CALL"}
 
-    s_name = st.radio("2. 选择具体战术", list(strat_map.keys()))
+    s_name = st.radio("2. 选择具体包子", list(strat_map.keys()))
     strat_code = strat_map[s_name]
     
     spread_width = 5
@@ -362,7 +362,7 @@ with st.sidebar:
     if st.button("🚀 启动全能引擎", type="primary", use_container_width=True):
         st.cache_data.clear()
 
-st.title(f"{ticker} 策略终端 v15.1 (修复版)")
+st.title(f"{ticker} 包子铺")
 
 with st.spinner(f'正在构建 {s_name} 策略矩阵...'):
     df, current_price, history, next_earnings, err = fetch_market_data(ticker, strat_code, spread_width, strike_range_pct)
@@ -379,7 +379,7 @@ else:
         r = best.iloc[0]
         c1, c2 = st.columns([1.5, 1])
         with c1:
-            st.subheader("🏆 最佳战术指令")
+            st.subheader("最佳战术指令")
             
             # 修复财报检测逻辑：安全地处理日期格式
             if next_earnings:
@@ -390,7 +390,7 @@ else:
                     exp_dt = datetime.strptime(exp_str, "%Y-%m-%d").date()
                     
                     if next_earnings <= exp_dt: st.warning(f"⚠️ 包含财报风险 ({next_earnings})")
-                    else: st.success("🛡️ 无财报风险")
+                    else: st.success("无财报风险")
                 except:
                     pass
 
@@ -410,6 +410,7 @@ else:
         render_chart(history, ticker, r)
         
     st.divider()
-    with st.expander("📋 完整策略列表"):
+    with st.expander("完整列表"):
         st.dataframe(df, use_container_width=True)
+
 
