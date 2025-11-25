@@ -8,7 +8,7 @@ import scipy.stats as si
 
 # --- 1. 页面配置 ---
 st.set_page_config(
-    page_title="美股期权终极军火库 (稳定版)", 
+    page_title="包子铺", 
     layout="wide", 
     page_icon="♾️",
     initial_sidebar_state="expanded"
@@ -412,3 +412,4 @@ else:
     st.divider()
     with st.expander("📋 完整策略列表"):
         st.dataframe(df, use_container_width=True)
+
