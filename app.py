@@ -249,7 +249,7 @@ with st.sidebar:
     if st.button("🚀 启动引擎", type="primary", use_container_width=True):
         st.cache_data.clear()
 
-st.title(f"{ticker} 策略终端 v16.0 (自适应版)")
+st.title(f"{ticker} 策略")
 
 with st.spinner(f'正在扫描 {s_name}...'):
     df, current_price, history, next_earnings, err = fetch_market_data(ticker, strat_code, spread_width, strike_range_pct)
@@ -304,3 +304,4 @@ if show_debug:
             st.dataframe(opt.calls.head())
     except Exception as e:
         st.error(f"调试信息获取失败: {e}")
+
